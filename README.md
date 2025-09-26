@@ -8,6 +8,8 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+*More about UV: https://docs.astral.sh/uv/*
+
 # Create new project
 ```bash
 uv init rl-chatbot
