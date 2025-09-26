@@ -18,11 +18,7 @@ cd rl-chatbot
 
 # Add dependencies
 ```bash
-uv add gymnasium torch transformers 
-```
-
-```bash
-sentence-transformers faiss-cpu numpy pandas
+uv add gymnasium torch transformers sentence-transformers faiss-cpu numpy pandas
 ```
 
 # How to run
