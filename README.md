@@ -22,3 +22,8 @@ uv add gymnasium torch transformers
 ```bash
 sentence-transformers faiss-cpu numpy pandas
 ```
+
+# How to run
+```bash
+uv run main.py
+```
