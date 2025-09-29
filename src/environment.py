@@ -6,28 +6,120 @@ import json
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-class ImprovedChatbotEnv(gym.Env):
-    def __init__(self, rag_retriever, qa_pairs_file="qa_pairs.json", max_turns=5):
+# environment.py (updated)
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+class ChatbotStudentEnv(gym.Env):
+    """
+    Environment that:
+    - uses a provided RAGRetriever (SentenceTransformer + FAISS)
+    - state: 5 discrete features (0..2)
+      [similarity, retrieval_conf, context_match, ambiguity, scope_match]
+    - actions: 5
+      0: quote (trích dẫn nguyên văn)
+      1: summary (tóm tắt)
+      2: paraphrase (diễn giải)
+      3: clarify (hỏi lại)
+      4: escalate (thoái lui an toàn)
+    - reward: mapped to values in the report: +3, -5, -8, -12, +2, -1
+    """
+
+    def __init__(self, rag_retriever, qa_pairs_file="qa_pairs.json", max_turns=5, top_k=3):
         super().__init__()
         self.rag_retriever = rag_retriever
+        self.top_k = top_k
         self.max_turns = max_turns
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        
-        # Load Q&A pairs for evaluation
+
+        # Load Q&A pairs (for expected answers / keywords)
         self.qa_pairs = self._load_qa_pairs(qa_pairs_file)
-        
-        # Action space: [retrieve_docs, generate_answer, ask_clarification]
-        self.action_space = spaces.Discrete(3)
-        
-        # State space: question embedding (384 dim)
-        self.observation_space = spaces.Box(
-            low=-1, high=1, shape=(384,), dtype=np.float32
-        )
-        
+
+        # Actions
+        self.action_space = spaces.Discrete(5)
+
+        # Observation: 5 discrete features each in {0,1,2}
+        self.observation_space = spaces.MultiDiscrete([3] * 5)
+
+        # internal state
+        self.current_qa = None
+        self.current_question = None
+        self.expected_keywords = None
+        self.retrieved_docs = []
+        self.state = None
+        self.turn_count = 0
+        self.question_answered = False
+        self.dialog_history = []  # store previous question embeddings (for context match)
         self.reset()
-    
+
+    # -------------------------
+    # Public Gym API
+    # -------------------------
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        # pick a random QA pair (mocking incoming user question)
+        self.current_qa = np.random.choice(self.qa_pairs)
+        self.current_question = self.current_qa["question"]
+        self.expected_keywords = self.current_qa.get("keywords", [])
+        self.retrieved_docs = []
+        self.turn_count = 0
+        self.question_answered = False
+        self.state = self._compute_state(self.current_question)
+        return self.state, {}
+
+    def step(self, action):
+        assert self.action_space.contains(action), "Invalid action"
+
+        reward = 0
+        terminated = False
+        info = {}
+
+        # If agent chooses an answering action
+        if action in [0, 1, 2]:
+            # calculate reward using retrieval + keyword checks + scope heuristics
+            reward = self._calculate_answer_reward(action)
+            self.question_answered = True
+            terminated = True
+
+        elif action == 3:  # ask clarification
+            # +2 if ambiguity present (worth asking), else -1
+            ambiguity = int(self.state[3])
+            reward = 2 if ambiguity >= 1 else -1
+            terminated = True
+
+        elif action == 4:  # escalate / safe retreat
+            reward = -1
+            terminated = True
+
+        # turn update
+        self.turn_count += 1
+        if self.turn_count >= self.max_turns:
+            terminated = True
+            if not self.question_answered:
+                reward -= 1.0  # penalty for not answering within max_turns
+
+        # recompute state (simulate next retrieval / new context)
+        self.state = self._compute_state(self.current_question)
+
+        info.update({
+            "question": self.current_question,
+            "turn": self.turn_count,
+            "answered": self.question_answered,
+            "expected_answer": self.current_qa.get("answer", ""),
+            "retrieved_docs": len(self.retrieved_docs)
+        })
+
+        return self.state, reward, terminated, False, info
+
+    def render(self, mode='human'):
+        print(f"Turn {self.turn_count} | State={self.state} | Retrieved={len(self.retrieved_docs)}")
+
+    # -------------------------
+    # Helpers: load data
+    # -------------------------
     def _load_qa_pairs(self, qa_file):
-        """Load Q&A pairs from file or create sample ones"""
+        # keep the sample pairs from your original file; you can replace by reading qa_file
         qa_pairs = [
             {
                 "question": "Học phần là gì?",
@@ -56,108 +148,169 @@ class ImprovedChatbotEnv(gym.Env):
             }
         ]
         return qa_pairs
-    
-    def reset(self, seed=None):
-        """Reset environment with a random question"""
-        self.current_qa = np.random.choice(self.qa_pairs)
-        self.current_question = self.current_qa["question"]
-        self.expected_keywords = self.current_qa["keywords"]
-        self.retrieved_docs = []
-        self.turn_count = 0
-        self.question_answered = False
-        
-        # Get question embedding as state
-        question_embedding = self.embedding_model.encode(self.current_question)
-        return question_embedding.astype(np.float32), {}
-    
-    def step(self, action):
-        reward = 0
-        terminated = False
-        info = {}
-        
-        if action == 0:  # Retrieve documents
-            if not self.question_answered:
-                self.retrieved_docs = self.rag_retriever.retrieve(self.current_question, top_k=3)
-                # Calculate reward based on keyword overlap
-                reward = self._calculate_retrieval_reward()
-                info['retrieved_docs'] = len(self.retrieved_docs)
+
+    # -------------------------
+    # Helpers: state computation using RAGRetriever
+    # -------------------------
+    def _compute_state(self, question):
+        """
+        Use RAG retriever to get top_k docs and compute the 5 discrete features:
+        similarity, retrieval_conf, context_match, ambiguity, scope_match
+        """
+        top_k = self.top_k
+
+        # Retrieve docs (textual)
+        docs = self.rag_retriever.retrieve(question, top_k=top_k)
+        self.retrieved_docs = docs
+
+        # compute similarity scores between query and ALL stored docs in retriever
+        # (so we can compute accurate top-k similarity)
+        try:
+            query_emb = self.rag_retriever.model.encode([question]).astype('float32')
+            all_embs = np.asarray(self.rag_retriever.embeddings).astype('float32')
+            sims = cosine_similarity(query_emb, all_embs)[0]  # shape (n_docs,)
+        except Exception:
+            # fallback: if embeddings are not available for some reason
+            sims = np.array([])
+
+        # pick top-k sims (if sims available)
+        if sims.size:
+            top_idx = np.argsort(-sims)[:top_k]
+            top_sims = sims[top_idx]
+            max_sim = float(top_sims.max())
+            avg_topk = float(top_sims.mean())
+        else:
+            max_sim = 0.0
+            avg_topk = 0.0
+
+        # similarity level mapping (report): <0.4 ->0, 0.4-0.7 ->1, >=0.7 ->2
+        if max_sim < 0.4:
+            similarity = 0
+        elif max_sim < 0.7:
+            similarity = 1
+        else:
+            similarity = 2
+
+        # retrieval confidence from avg_topk: <0.3 ->0, 0.3-0.6 ->1, >=0.6 ->2
+        if avg_topk < 0.3:
+            retrieval_conf = 0
+        elif avg_topk < 0.6:
+            retrieval_conf = 1
+        else:
+            retrieval_conf = 2
+
+        # context_match: check if last user question in history is similar to current (>0.7 ->2, 0.4-0.7 ->1)
+        if len(self.dialog_history) == 0:
+            context_match = 0
+        else:
+            try:
+                last_emb = self.dialog_history[-1]
+                ctx_sim = float(cosine_similarity(query_emb, last_emb.reshape(1, -1))[0][0])
+                if ctx_sim >= 0.7:
+                    context_match = 2
+                elif ctx_sim >= 0.4:
+                    context_match = 1
+                else:
+                    context_match = 0
+            except Exception:
+                context_match = 0
+
+        # ambiguity heuristic (simple rule-based):
+        q_lower = question.lower()
+        if ("hoặc" in q_lower) or ("hay" in q_lower and "hay không" not in q_lower):
+            ambiguity = 1
+        elif any(p in q_lower for p in ["thông tin", "vấn đề", "như thế nào", "làm sao", "cách"]) or len(q_lower.split()) < 4:
+            ambiguity = 2
+        else:
+            ambiguity = 0
+
+        # scope_match heuristic: check if retrieved docs contain scope-related keywords
+        top_docs_text = " ".join(docs).lower() if docs else ""
+        scope_keywords = ["sinh viên", "khoa", "ngành", "năm", "chính quy", "học kỳ", "tín chỉ", "phòng đào tạo", "giáo vụ"]
+        if any(kw in top_docs_text for kw in scope_keywords):
+            scope_match = 2
+        else:
+            # partial match if docs contain some domain-ish tokens (e.g., 'học', 'kỳ', 'điều kiện')
+            if any(kw in top_docs_text for kw in ["học", "điều kiện", "thi", "học phí", "đăng ký"]):
+                scope_match = 1
             else:
-                reward = -0.5  # Penalty for retrieving after answering
-        
-        elif action == 1:  # Generate answer
-            if self.retrieved_docs and not self.question_answered:
-                # Reward for answering with retrieved context
-                reward = self._calculate_answer_reward()
-                self.question_answered = True
-                terminated = True
-            elif not self.retrieved_docs:
-                reward = -2.0  # Big penalty for answering without context
-                terminated = True
-            else:
-                reward = -0.5  # Already answered
-                terminated = True
-        
-        elif action == 2:  # Ask clarification
-            if not self.question_answered:
-                reward = 0.2  # Small positive for being cautious
-                terminated = True
-            else:
-                reward = -0.3  # Too late to ask
-                terminated = True
-        
-        self.turn_count += 1
-        if self.turn_count >= self.max_turns:
-            terminated = True
-            if not self.question_answered:
-                reward -= 1.0  # Penalty for not answering
-        
-        # Get current state (question embedding doesn't change)
-        question_embedding = self.embedding_model.encode(self.current_question)
-        
-        info.update({
-            'question': self.current_question,
-            'turn': self.turn_count,
-            'answered': self.question_answered,
-            'expected_answer': self.current_qa["answer"]
-        })
-        
-        return question_embedding.astype(np.float32), reward, terminated, False, info
-    
+                scope_match = 0
+
+        # push current query embedding into dialog history (for future steps)
+        try:
+            self.dialog_history.append(query_emb.flatten())
+            # keep max history length small
+            if len(self.dialog_history) > 8:
+                self.dialog_history.pop(0)
+        except Exception:
+            pass
+
+        state = np.array([similarity, retrieval_conf, context_match, ambiguity, scope_match], dtype=np.int32)
+        return state
+
+    # -------------------------
+    # Retrieval / Answer reward functions
+    # -------------------------
     def _calculate_retrieval_reward(self):
-        """Calculate reward based on how relevant retrieved documents are"""
+        """
+        Returns a continuous retrieval score (float) based on keyword overlap,
+        used internally or for diagnostics. Not used directly as the discrete final reward.
+        """
         if not self.retrieved_docs:
-            return -1.0
-        
-        # Check if retrieved docs contain expected keywords
+            return 0.0
+
         retrieved_text = " ".join(self.retrieved_docs).lower()
-        keyword_matches = sum(1 for keyword in self.expected_keywords 
-                            if keyword.lower() in retrieved_text)
-        
-        # Reward based on keyword coverage
+        if not self.expected_keywords:
+            return 0.0
+
+        keyword_matches = sum(1 for kw in self.expected_keywords if kw.lower() in retrieved_text)
         keyword_ratio = keyword_matches / len(self.expected_keywords)
-        
-        if keyword_ratio >= 0.6:  # Good retrieval
-            return 2.0
-        elif keyword_ratio >= 0.3:  # Decent retrieval
-            return 1.0
-        else:  # Poor retrieval
-            return 0.2
-    
-    def _calculate_answer_reward(self):
-        """Calculate reward for answering with context"""
-        # Base reward for answering with retrieved documents
-        base_reward = 1.5
-        
-        # Bonus if retrieved docs are highly relevant
-        retrieved_text = " ".join(self.retrieved_docs).lower()
-        keyword_matches = sum(1 for keyword in self.expected_keywords 
-                            if keyword.lower() in retrieved_text)
-        keyword_ratio = keyword_matches / len(self.expected_keywords)
-        
-        # Additional reward based on relevance
-        relevance_bonus = keyword_ratio * 1.0
-        
-        return base_reward + relevance_bonus
+        # scale 0..2
+        return float(keyword_ratio * 2.0)
+
+    def _calculate_answer_reward(self, action):
+        """
+        Map (state, retrieval quality, keyword overlap) into the discrete rewards from the report:
+          +3: correct answer with valid citation and correct scope
+          -5: missing citation / low confidence while question ambiguous (should have asked)
+          -8: wrong scope (khoa/ngành/năm)
+          -12: hallucination or severe incorrect / user dislike
+          +2: good clarification
+          -1: useless clarification or escalate cost
+        Heuristics are used because we don't have explicit user feedback signals.
+        """
+        # unpack state
+        similarity, retrieval_conf, context_match, ambiguity, scope_match = map(int, self.state)
+
+        # keyword coverage
+        retrieved_text = " ".join(self.retrieved_docs).lower() if self.retrieved_docs else ""
+        keyword_matches = 0
+        if self.expected_keywords:
+            keyword_matches = sum(1 for kw in self.expected_keywords if kw.lower() in retrieved_text)
+            keyword_ratio = keyword_matches / len(self.expected_keywords)
+        else:
+            keyword_ratio = 0.0
+
+        # If scope mismatch => -8
+        if scope_match == 0:
+            return -8
+
+        # No retrieved evidence (low retrieval_conf) -> either -5 (if ambiguous) or -12 (hallucination)
+        if retrieval_conf == 0:
+            if ambiguity >= 1:
+                return -5  # should have asked clarifying
+            else:
+                return -12  # hallucination / severe error
+
+        # If we have some retrieval evidence:
+        # Award +3 when keyword coverage is high AND scope matches
+        if keyword_ratio >= 0.6 and scope_match == 2:
+            return 3
+
+        # If partial evidence but not sufficient -> penalize as missing citation / low reliability
+        return -5
+
+
 
 
 # improved_agents.py
@@ -351,7 +504,7 @@ def main():
     rag_retriever = RAGRetriever(documents)
     
     # Create improved environment
-    env = ImprovedChatbotEnv(rag_retriever)
+    env = ChatbotStudentEnv(rag_retriever)
     
     print("Training Q-Learning Agent...")
     q_agent = ImprovedQLearningAgent(env.action_space)
